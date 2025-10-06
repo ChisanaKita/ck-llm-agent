@@ -21,6 +21,13 @@ from .config_validation import (
     get_config_service,
 )
 
+from .mcp_registry import MCPRegistry
+from .tool_adapter import ToolAdapter, MCPToolExecutor, CrewAIToolWrapper
+from .semantic_search import SemanticSearchEngine, EmbeddingService
+from .tool_selector import ToolSelector
+from .tool_executor import ToolExecutor, ToolExecutionError, ExecutionContext
+from .embedding_manager import EmbeddingManager, EmbeddingQualityMetrics, EmbeddingBatch
+
 __all__ = [
     "SystemHealthService",
     "HealthCheckResult", 
@@ -32,4 +39,17 @@ __all__ = [
     "EndpointValidator", 
     "ConfigValidationError",
     "get_config_service",
+    "MCPRegistry",
+    "ToolAdapter",
+    "MCPToolExecutor",
+    "CrewAIToolWrapper",
+    "SemanticSearchEngine",
+    "EmbeddingService",
+    "ToolSelector",
+    "ToolExecutor",
+    "ToolExecutionError",
+    "ExecutionContext",
+    "EmbeddingManager",
+    "EmbeddingQualityMetrics",
+    "EmbeddingBatch",
 ]
