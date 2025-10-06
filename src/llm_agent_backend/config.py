@@ -5,35 +5,120 @@ This module provides centralized configuration using Pydantic Settings with
 environment variable support and validation.
 """
 
-import os
 from functools import lru_cache
-from typing import Optional, List
+from typing import Optional
 from pydantic import BaseModel, Field, validator
 from pydantic_settings import BaseSettings
+
+
+class VLLMEndpointConfig(BaseModel):
+    """Configuration for a single vLLM endpoint."""
+    
+    base_url: str = Field(description="Base URL for the vLLM server")
+    model: str = Field(description="Model name served by this endpoint")
+    api_key: Optional[str] = Field(default=None, description="API key for authentication")
+    timeout: int = Field(default=60, ge=5, le=300, description="Request timeout in seconds")
+    max_retries: int = Field(default=3, ge=1, le=10, description="Maximum retry attempts")
+    connection_pool_size: int = Field(default=10, ge=1, le=100, description="Connection pool size")
+    health_check_interval: int = Field(default=30, ge=5, le=300, description="Health check interval in seconds")
+    circuit_breaker_threshold: int = Field(default=5, ge=1, le=20, description="Circuit breaker failure threshold")
+    circuit_breaker_timeout: int = Field(default=60, ge=10, le=600, description="Circuit breaker recovery timeout")
+    
+    @validator("base_url")
+    def validate_base_url(cls, v):
+        """Validate base URL format."""
+        if not v.startswith(("http://", "https://")):
+            raise ValueError("Base URL must start with http:// or https://")
+        return v.rstrip("/")
 
 
 class VLLMConfig(BaseModel):
     """Configuration for vLLM endpoints."""
     
-    chat_base_url: str = Field(
-        default="http://localhost:8000",
-        description="Base URL for vLLM chat inference server"
+    # Primary endpoints
+    chat: VLLMEndpointConfig = Field(
+        default_factory=lambda: VLLMEndpointConfig(
+            base_url="http://localhost:8000",
+            model="Qwen/Qwen3-8B-AWQ"
+        ),
+        description="Chat completion endpoint configuration"
     )
-    embedding_base_url: str = Field(
-        default="http://localhost:8001", 
-        description="Base URL for vLLM embedding server"
+    embedding: VLLMEndpointConfig = Field(
+        default_factory=lambda: VLLMEndpointConfig(
+            base_url="http://localhost:8001",
+            model="Qwen/Qwen3-Embedding-0.6B"
+        ),
+        description="Embedding endpoint configuration"
     )
-    chat_model: str = Field(
-        default="Qwen/Qwen3-8B-AWQ",
-        description="Model name for chat completions"
+    
+    # External service configurations
+    runpod_chat_endpoint: Optional[str] = Field(
+        default=None,
+        description="Runpod chat endpoint URL (overrides chat.base_url if set)"
     )
-    embedding_model: str = Field(
-        default="Qwen/Qwen3-Embedding-0.6B",
-        description="Model name for embeddings"
+    runpod_embedding_endpoint: Optional[str] = Field(
+        default=None,
+        description="Runpod embedding endpoint URL (overrides embedding.base_url if set)"
     )
-    max_retries: int = Field(default=3, ge=1, le=10)
-    timeout: int = Field(default=60, ge=5, le=300)
-    connection_pool_size: int = Field(default=10, ge=1, le=100)
+    runpod_api_key: Optional[str] = Field(
+        default=None,
+        description="Runpod API key for authentication"
+    )
+    
+    # Global settings
+    enable_health_monitoring: bool = Field(default=True, description="Enable endpoint health monitoring")
+    enable_circuit_breaker: bool = Field(default=True, description="Enable circuit breaker pattern")
+    
+    # Legacy support (for backward compatibility)
+    chat_base_url: Optional[str] = Field(default=None, description="Legacy chat base URL")
+    embedding_base_url: Optional[str] = Field(default=None, description="Legacy embedding base URL")
+    chat_model: Optional[str] = Field(default=None, description="Legacy chat model name")
+    embedding_model: Optional[str] = Field(default=None, description="Legacy embedding model name")
+    max_retries: Optional[int] = Field(default=None, description="Legacy max retries")
+    timeout: Optional[int] = Field(default=None, description="Legacy timeout")
+    connection_pool_size: Optional[int] = Field(default=None, description="Legacy connection pool size")
+    
+    def __init__(self, **data):
+        """Initialize with legacy support."""
+        super().__init__(**data)
+        
+        # Apply legacy settings if provided
+        if self.chat_base_url:
+            self.chat.base_url = self.chat_base_url
+        if self.embedding_base_url:
+            self.embedding.base_url = self.embedding_base_url
+        if self.chat_model:
+            self.chat.model = self.chat_model
+        if self.embedding_model:
+            self.embedding.model = self.embedding_model
+        if self.max_retries:
+            self.chat.max_retries = self.max_retries
+            self.embedding.max_retries = self.max_retries
+        if self.timeout:
+            self.chat.timeout = self.timeout
+            self.embedding.timeout = self.timeout
+        if self.connection_pool_size:
+            self.chat.connection_pool_size = self.connection_pool_size
+            self.embedding.connection_pool_size = self.connection_pool_size
+        
+        # Apply Runpod overrides if configured
+        if self.runpod_chat_endpoint:
+            self.chat.base_url = self.runpod_chat_endpoint
+            if self.runpod_api_key:
+                self.chat.api_key = self.runpod_api_key
+        
+        if self.runpod_embedding_endpoint:
+            self.embedding.base_url = self.runpod_embedding_endpoint
+            if self.runpod_api_key:
+                self.embedding.api_key = self.runpod_api_key
+    
+    def get_chat_config(self) -> VLLMEndpointConfig:
+        """Get chat endpoint configuration."""
+        return self.chat
+    
+    def get_embedding_config(self) -> VLLMEndpointConfig:
+        """Get embedding endpoint configuration."""
+        return self.embedding
 
 
 class ChromaDBConfig(BaseModel):
