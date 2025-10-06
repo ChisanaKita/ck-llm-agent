@@ -12,7 +12,18 @@ from urllib.parse import urlparse
 import aiohttp
 
 from ..config import VLLMEndpointConfig, get_settings
-from ..handlers.endpoint_manager import EndpointType
+# Define EndpointType locally to avoid circular import
+from enum import Enum
+
+class EndpointType(str, Enum):
+    """Supported endpoint types."""
+    LOCAL = "local"
+    RUNPOD = "runpod"
+    HUGGINGFACE = "huggingface"
+    AWS = "aws"
+    GCP = "gcp"
+    AZURE = "azure"
+    EXTERNAL = "external"
 
 
 logger = logging.getLogger(__name__)

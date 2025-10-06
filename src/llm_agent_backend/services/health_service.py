@@ -11,7 +11,7 @@ from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
 from enum import Enum
 
-from ..handlers.endpoint_manager import get_endpoint_manager
+# Avoid circular import - import endpoint_manager when needed
 from ..models.api import HealthStatus, ServiceHealth, HealthResponse
 from ..config import get_settings
 

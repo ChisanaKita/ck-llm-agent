@@ -566,20 +566,36 @@ class ConnectionManager:
             return True
         return False
     
-    async def shutdown_all(self) -> None:
-        """Shutdown all connection pools."""
+    async def shutdown_all(self, timeout: float = 30.0) -> None:
+        """
+        Shutdown all connection pools with timeout.
+        
+        Args:
+            timeout: Maximum time to wait for graceful shutdown
+        """
         logger.info(f"Shutting down all {len(self.pools)} connection pools")
         
         self._shutdown_event.set()
         
-        # Shutdown all pools concurrently
+        # Shutdown all pools concurrently with timeout
         shutdown_tasks = []
         for pool_id, pool in list(self.pools.items()):
             task = asyncio.create_task(self._remove_pool(pool_id))
             shutdown_tasks.append(task)
         
         if shutdown_tasks:
-            await asyncio.gather(*shutdown_tasks, return_exceptions=True)
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*shutdown_tasks, return_exceptions=True),
+                    timeout=timeout
+                )
+            except asyncio.TimeoutError:
+                logger.warning(f"Shutdown timeout after {timeout}s, forcing closure")
+                
+                # Cancel remaining tasks
+                for task in shutdown_tasks:
+                    if not task.done():
+                        task.cancel()
         
         logger.info("All connection pools shutdown complete")
     
@@ -623,6 +639,122 @@ class ConnectionManager:
             pool_id for pool_id, pool in self.pools.items()
             if not pool.is_healthy()
         ]
+    
+    async def cleanup_stale_pools(self, max_idle_time: int = 300) -> int:
+        """
+        Clean up stale connection pools that haven't been used recently.
+        
+        Args:
+            max_idle_time: Maximum idle time in seconds before cleanup
+            
+        Returns:
+            Number of pools cleaned up
+        """
+        current_time = time.time()
+        stale_pools = []
+        
+        for pool_id, pool in self.pools.items():
+            # Check if pool has been idle for too long
+            if (hasattr(pool, '_last_health_check') and 
+                pool._last_health_check and
+                (current_time - pool._last_health_check.timestamp()) > max_idle_time):
+                
+                # Only cleanup if pool is not actively being used
+                if len(pool._active_requests) == 0:
+                    stale_pools.append(pool_id)
+        
+        # Remove stale pools
+        cleanup_count = 0
+        for pool_id in stale_pools:
+            if await self._remove_pool(pool_id):
+                cleanup_count += 1
+                logger.info(f"Cleaned up stale connection pool: {pool_id}")
+        
+        return cleanup_count
+    
+    async def optimize_pool_sizes(self) -> None:
+        """
+        Optimize connection pool sizes based on usage patterns.
+        
+        Adjusts pool sizes dynamically based on request patterns and
+        available system resources.
+        """
+        if not self.pools:
+            return
+        
+        # Calculate optimal distribution
+        optimal_size_per_pool = max(
+            1, 
+            self.max_total_connections // len(self.pools)
+        )
+        
+        for pool_id, pool in self.pools.items():
+            current_active = len(pool._active_requests)
+            
+            # Adjust semaphore limit based on usage
+            if current_active > pool.max_concurrent_requests * 0.8:
+                # High usage - consider increasing limit
+                new_limit = min(
+                    optimal_size_per_pool,
+                    pool.max_concurrent_requests + 5
+                )
+                if new_limit > pool.max_concurrent_requests:
+                    pool.max_concurrent_requests = new_limit
+                    # Create new semaphore with updated limit
+                    pool._semaphore = asyncio.Semaphore(new_limit)
+                    logger.debug(f"Increased pool {pool_id} limit to {new_limit}")
+            
+            elif current_active < pool.max_concurrent_requests * 0.2:
+                # Low usage - consider decreasing limit
+                new_limit = max(
+                    1,
+                    pool.max_concurrent_requests - 2
+                )
+                if new_limit < pool.max_concurrent_requests:
+                    pool.max_concurrent_requests = new_limit
+                    # Create new semaphore with updated limit
+                    pool._semaphore = asyncio.Semaphore(new_limit)
+                    logger.debug(f"Decreased pool {pool_id} limit to {new_limit}")
+    
+    async def get_resource_usage(self) -> Dict[str, Any]:
+        """
+        Get detailed resource usage information.
+        
+        Returns:
+            Resource usage statistics
+        """
+        total_active_requests = sum(
+            len(pool._active_requests) for pool in self.pools.values()
+        )
+        
+        total_max_connections = sum(
+            pool.max_concurrent_requests for pool in self.pools.values()
+        )
+        
+        pool_details = {}
+        for pool_id, pool in self.pools.items():
+            pool_details[pool_id] = {
+                "active_requests": len(pool._active_requests),
+                "max_concurrent": pool.max_concurrent_requests,
+                "utilization": len(pool._active_requests) / max(pool.max_concurrent_requests, 1),
+                "state": pool.state.value,
+                "consecutive_failures": pool._consecutive_failures,
+                "circuit_breaker_open": pool._circuit_breaker_open,
+                "session_closed": pool._session.closed if pool._session else True
+            }
+        
+        return {
+            "total_pools": len(self.pools),
+            "total_active_requests": total_active_requests,
+            "total_max_connections": total_max_connections,
+            "global_utilization": total_active_requests / max(total_max_connections, 1),
+            "available_capacity": self.max_total_connections - total_active_requests,
+            "pool_details": pool_details,
+            "memory_usage": {
+                "processing_batches": len(getattr(self, '_processing_batches', {})),
+                "weak_references": len(self._pool_refs)
+            }
+        }
 
 
 # Global connection manager instance
