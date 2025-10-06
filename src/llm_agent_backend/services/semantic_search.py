@@ -3,6 +3,7 @@ Semantic Search Engine with ChromaDB for tool selection.
 
 This module implements semantic search capabilities using ChromaDB vector database
 and vLLM embeddings API for intelligent tool selection based on context similarity.
+Enhanced with advanced caching and performance optimizations.
 """
 
 import asyncio
@@ -17,6 +18,8 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 from ..models.internal import MCPTool, SemanticSearchQuery, SemanticSearchResult
 from ..utils.logging import get_logger
+from .cache_manager import ResponseCacheManager
+from .chromadb_manager import ChromaDBManager, ChromaDBConfig
 
 logger = get_logger(__name__)
 
@@ -657,3 +660,473 @@ class SemanticSearchEngine:
             
             self._tool_cache.clear()
             logger.info("Cleared all tool embeddings from collection")
+
+
+class EnhancedSemanticSearchEngine:
+    """
+    Enhanced semantic search engine with advanced caching and ChromaDB optimization.
+    
+    This class provides high-performance semantic search with response caching,
+    optimized ChromaDB configuration, and comprehensive performance monitoring.
+    """
+    
+    def __init__(
+        self,
+        embedding_service: EmbeddingService,
+        chromadb_config: Optional[ChromaDBConfig] = None,
+        enable_caching: bool = True,
+        cache_ttl: int = 3600,
+        max_cache_size: int = 1000
+    ):
+        """
+        Initialize enhanced semantic search engine.
+        
+        Args:
+            embedding_service: Service for generating embeddings
+            chromadb_config: ChromaDB configuration (uses default if None)
+            enable_caching: Enable response caching
+            cache_ttl: Cache TTL in seconds
+            max_cache_size: Maximum cache size
+        """
+        self.embedding_service = embedding_service
+        self.chromadb_config = chromadb_config or ChromaDBConfig()
+        
+        # Initialize managers
+        self.chromadb_manager = ChromaDBManager(
+            config=self.chromadb_config,
+            embedding_service=embedding_service
+        )
+        
+        self.cache_manager = ResponseCacheManager(
+            max_size=max_cache_size,
+            default_ttl=cache_ttl,
+            enable_persistence=True,
+            persistence_path=f"{self.chromadb_config.persist_directory}/search_cache.pkl"
+        ) if enable_caching else None
+        
+        # Statistics
+        self.search_count = 0
+        self.cache_hits = 0
+        self.cache_misses = 0
+        self.total_search_time = 0.0
+        
+        logger.info("EnhancedSemanticSearchEngine initialized")
+    
+    async def initialize(self) -> None:
+        """Initialize the enhanced semantic search engine."""
+        logger.info("Initializing enhanced semantic search engine")
+        
+        # Initialize embedding service
+        await self.embedding_service.initialize()
+        
+        # Initialize ChromaDB manager
+        await self.chromadb_manager.initialize()
+        
+        # Initialize cache manager
+        if self.cache_manager:
+            await self.cache_manager.initialize()
+        
+        logger.info("Enhanced semantic search engine initialized successfully")
+    
+    async def shutdown(self) -> None:
+        """Shutdown the enhanced semantic search engine."""
+        logger.info("Shutting down enhanced semantic search engine")
+        
+        # Shutdown managers
+        await self.chromadb_manager.shutdown()
+        
+        if self.cache_manager:
+            await self.cache_manager.shutdown()
+        
+        await self.embedding_service.shutdown()
+        
+        logger.info("Enhanced semantic search engine shutdown complete")
+    
+    async def add_tool_embeddings(
+        self,
+        tools: List[MCPTool],
+        batch_size: Optional[int] = None,
+        force_regenerate: bool = False
+    ) -> Dict[str, Any]:
+        """
+        Add tool embeddings with optimized batch processing.
+        
+        Args:
+            tools: List of tools to add embeddings for
+            batch_size: Batch size for processing
+            force_regenerate: Force regeneration of existing embeddings
+            
+        Returns:
+            Operation results
+        """
+        if not tools:
+            return {"added": 0, "updated": 0, "errors": 0}
+        
+        logger.info(f"Adding embeddings for {len(tools)} tools")
+        
+        # Filter tools that need embeddings
+        tools_to_process = []
+        for tool in tools:
+            if force_regenerate or not tool.embedding or not tool.embedding_updated:
+                tools_to_process.append(tool)
+        
+        if not tools_to_process:
+            logger.info("All tools already have embeddings")
+            return {"added": 0, "updated": 0, "errors": 0}
+        
+        # Generate embeddings for tools that don't have them
+        for tool in tools_to_process:
+            if not tool.embedding:
+                try:
+                    tool_text = self._create_tool_text(tool)
+                    tool.embedding = await self.embedding_service.generate_embedding(tool_text)
+                    tool.embedding_updated = datetime.utcnow()
+                except Exception as e:
+                    logger.error(f"Failed to generate embedding for {tool.name}: {e}")
+        
+        # Add to ChromaDB
+        result = await self.chromadb_manager.add_tool_embeddings(tools_to_process, batch_size)
+        
+        # Invalidate related cache entries
+        if self.cache_manager:
+            await self.cache_manager.invalidate_by_tags({"tool_search", "semantic_search"})
+        
+        logger.info(f"Tool embedding operation completed: {result}")
+        return result
+    
+    async def search_relevant_tools(
+        self,
+        query: SemanticSearchQuery,
+        use_cache: bool = True
+    ) -> List[SemanticSearchResult]:
+        """
+        Search for relevant tools with caching and optimization.
+        
+        Args:
+            query: Semantic search query
+            use_cache: Whether to use caching
+            
+        Returns:
+            List of relevant tools with similarity scores
+        """
+        start_time = asyncio.get_event_loop().time()
+        self.search_count += 1
+        
+        try:
+            # Check cache first
+            cache_key = None
+            if self.cache_manager and use_cache:
+                cache_key = self._generate_search_cache_key(query)
+                cached_results = await self.cache_manager.get(cache_key)
+                
+                if cached_results:
+                    self.cache_hits += 1
+                    logger.debug(f"Returning cached search results for query: {query.query[:50]}...")
+                    return cached_results
+                
+                self.cache_misses += 1
+            
+            # Generate query embedding
+            query_embedding = await self.embedding_service.generate_embedding(query.query)
+            
+            # Prepare metadata filter
+            where_filter = {}
+            if query.categories:
+                where_filter["category"] = {"$in": query.categories}
+            
+            # Perform similarity search
+            search_results = await self.chromadb_manager.search_similar_tools(
+                query_embedding=query_embedding,
+                n_results=query.max_results,
+                where_filter=where_filter if where_filter else None,
+                similarity_threshold=query.similarity_threshold
+            )
+            
+            # Convert to SemanticSearchResult objects
+            results = []
+            for result in search_results:
+                # Skip excluded tools
+                if query.exclude_tools and result["tool_id"] in query.exclude_tools:
+                    continue
+                
+                # Reconstruct tool from metadata
+                tool = self._reconstruct_tool_from_result(result)
+                if tool:
+                    relevance_reason = self._generate_relevance_reason(
+                        query, tool, result["similarity_score"]
+                    )
+                    
+                    results.append(SemanticSearchResult(
+                        tool=tool,
+                        similarity_score=result["similarity_score"],
+                        relevance_reason=relevance_reason
+                    ))
+            
+            # Sort by similarity score
+            results.sort(key=lambda x: x.similarity_score, reverse=True)
+            
+            # Cache results
+            if self.cache_manager and use_cache and cache_key:
+                cache_tags = {"tool_search", "semantic_search"}
+                if query.categories:
+                    cache_tags.update(f"category:{cat}" for cat in query.categories)
+                
+                await self.cache_manager.set(
+                    cache_key,
+                    results,
+                    tags=cache_tags
+                )
+            
+            # Update statistics
+            execution_time = asyncio.get_event_loop().time() - start_time
+            self.total_search_time += execution_time
+            
+            logger.debug(
+                f"Semantic search returned {len(results)} results in {execution_time:.3f}s "
+                f"for query: {query.query[:50]}..."
+            )
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"Enhanced semantic search failed: {e}")
+            raise
+    
+    async def update_tool_embedding(
+        self,
+        tool: MCPTool,
+        invalidate_cache: bool = True
+    ) -> None:
+        """
+        Update embedding for a single tool.
+        
+        Args:
+            tool: Tool to update embedding for
+            invalidate_cache: Whether to invalidate related cache entries
+        """
+        try:
+            # Generate new embedding
+            tool_text = self._create_tool_text(tool)
+            tool.embedding = await self.embedding_service.generate_embedding(tool_text)
+            tool.embedding_updated = datetime.utcnow()
+            
+            # Update in ChromaDB
+            await self.chromadb_manager.add_tool_embeddings([tool])
+            
+            # Invalidate cache
+            if self.cache_manager and invalidate_cache:
+                await self.cache_manager.invalidate_by_tags({
+                    "tool_search",
+                    "semantic_search",
+                    f"tool:{tool.name}"
+                })
+            
+            logger.debug(f"Updated embedding for tool: {tool.name}")
+            
+        except Exception as e:
+            logger.error(f"Failed to update tool embedding for {tool.name}: {e}")
+            raise
+    
+    async def get_conversation_context(
+        self,
+        conversation_id: str,
+        context_text: str
+    ) -> Optional[List[float]]:
+        """
+        Get or create conversation context embedding.
+        
+        Args:
+            conversation_id: Conversation identifier
+            context_text: Context text to embed
+            
+        Returns:
+            Context embedding vector
+        """
+        try:
+            # Check cache first
+            cache_key = f"context:{conversation_id}"
+            if self.cache_manager:
+                cached_embedding = await self.cache_manager.get(cache_key)
+                if cached_embedding:
+                    return cached_embedding
+            
+            # Generate context embedding
+            context_embedding = await self.embedding_service.generate_embedding(context_text)
+            
+            # Store in ChromaDB
+            metadata = {
+                "conversation_id": conversation_id,
+                "context_length": len(context_text),
+                "created_at": datetime.utcnow().isoformat()
+            }
+            
+            await self.chromadb_manager.add_conversation_context(
+                conversation_id, context_embedding, metadata
+            )
+            
+            # Cache the embedding
+            if self.cache_manager:
+                await self.cache_manager.set(
+                    cache_key,
+                    context_embedding,
+                    ttl=7200,  # 2 hours
+                    tags={"conversation_context"}
+                )
+            
+            return context_embedding
+            
+        except Exception as e:
+            logger.error(f"Failed to get conversation context for {conversation_id}: {e}")
+            return None
+    
+    def _generate_search_cache_key(self, query: SemanticSearchQuery) -> str:
+        """Generate cache key for search query."""
+        key_data = {
+            "query": query.query,
+            "max_results": query.max_results,
+            "similarity_threshold": query.similarity_threshold,
+            "categories": sorted(query.categories) if query.categories else None,
+            "exclude_tools": sorted(query.exclude_tools) if query.exclude_tools else None
+        }
+        
+        key_str = json.dumps(key_data, sort_keys=True)
+        return f"search:{hash(key_str) % 2**32}"
+    
+    def _reconstruct_tool_from_result(self, result: Dict[str, Any]) -> Optional[MCPTool]:
+        """Reconstruct MCPTool from search result."""
+        try:
+            metadata = result.get("metadata", {})
+            
+            tags = []
+            if "tags" in metadata:
+                try:
+                    tags = json.loads(metadata["tags"])
+                except (json.JSONDecodeError, TypeError):
+                    tags = []
+            
+            tool = MCPTool(
+                name=result["tool_id"],
+                description=metadata.get("description", ""),
+                server_name=metadata.get("server_name", "unknown"),
+                input_schema={},  # Schema not stored in metadata
+                category=metadata.get("category"),
+                tags=tags,
+                usage_count=metadata.get("usage_count", 0)
+            )
+            
+            return tool
+            
+        except Exception as e:
+            logger.error(f"Failed to reconstruct tool from result: {e}")
+            return None
+    
+    def _create_tool_text(self, tool: MCPTool) -> str:
+        """Create text representation of tool for embedding."""
+        parts = [f"Tool: {tool.name}"]
+        
+        if tool.description:
+            parts.append(f"Description: {tool.description}")
+        
+        if tool.category:
+            parts.append(f"Category: {tool.category}")
+        
+        if tool.tags:
+            parts.append(f"Tags: {', '.join(tool.tags)}")
+        
+        # Add schema information
+        if tool.input_schema:
+            schema_desc = self._describe_schema(tool.input_schema)
+            if schema_desc:
+                parts.append(f"Parameters: {schema_desc}")
+        
+        return " | ".join(parts)
+    
+    def _describe_schema(self, schema: Dict[str, Any]) -> str:
+        """Create human-readable description of a JSON schema."""
+        if not isinstance(schema, dict):
+            return ""
+        
+        properties = schema.get("properties", {})
+        required = schema.get("required", [])
+        
+        descriptions = []
+        for prop_name, prop_def in properties.items():
+            prop_type = prop_def.get("type", "unknown")
+            prop_desc = prop_def.get("description", "")
+            
+            is_required = prop_name in required
+            req_marker = " (required)" if is_required else " (optional)"
+            
+            if prop_desc:
+                descriptions.append(f"{prop_name} ({prop_type}): {prop_desc}{req_marker}")
+            else:
+                descriptions.append(f"{prop_name} ({prop_type}){req_marker}")
+        
+        return "; ".join(descriptions)
+    
+    def _generate_relevance_reason(
+        self,
+        query: SemanticSearchQuery,
+        tool: MCPTool,
+        similarity_score: float
+    ) -> str:
+        """Generate relevance reason for tool selection."""
+        reasons = []
+        
+        # Score-based reason
+        if similarity_score > 0.9:
+            reasons.append("highly relevant")
+        elif similarity_score > 0.8:
+            reasons.append("very relevant")
+        elif similarity_score > 0.7:
+            reasons.append("relevant")
+        else:
+            reasons.append("potentially relevant")
+        
+        # Category match
+        if query.categories and tool.category in query.categories:
+            reasons.append(f"matches category '{tool.category}'")
+        
+        # Usage popularity
+        if tool.usage_count > 10:
+            reasons.append("frequently used")
+        elif tool.usage_count > 0:
+            reasons.append("previously used")
+        
+        return f"Tool is {', '.join(reasons)} (similarity: {similarity_score:.2f})"
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get comprehensive statistics."""
+        stats = {
+            "search_count": self.search_count,
+            "cache_hits": self.cache_hits,
+            "cache_misses": self.cache_misses,
+            "cache_hit_rate": self.cache_hits / max(self.search_count, 1),
+            "average_search_time": self.total_search_time / max(self.search_count, 1),
+            "total_search_time": self.total_search_time
+        }
+        
+        # Add ChromaDB stats
+        stats["chromadb"] = self.chromadb_manager.get_stats()
+        
+        # Add cache stats
+        if self.cache_manager:
+            stats["cache"] = self.cache_manager.get_stats()
+        
+        # Add embedding service stats
+        stats["embedding_service"] = self.embedding_service.get_stats()
+        
+        return stats
+    
+    async def cleanup(self) -> None:
+        """Perform cleanup operations."""
+        logger.info("Performing enhanced semantic search cleanup")
+        
+        # Cleanup cache
+        if self.cache_manager:
+            # Clear expired entries (handled automatically by cache manager)
+            pass
+        
+        # ChromaDB maintenance is handled by its own maintenance loop
+        
+        logger.info("Enhanced semantic search cleanup completed")
