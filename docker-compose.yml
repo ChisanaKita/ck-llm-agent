@@ -1,0 +1,124 @@
+version: '3.8'
+
+services:
+  # Main LLM Agent Backend service
+  llm-agent-backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    ports:
+      - "8080:8080"
+    environment:
+      - ENVIRONMENT=development
+      - DEBUG=true
+      - LOG_LEVEL=INFO
+      - VLLM__CHAT_BASE_URL=http://vllm-chat:8000
+      - VLLM__EMBEDDING_BASE_URL=http://vllm-embedding:8001
+      - CHROMADB__PERSIST_DIRECTORY=/app/data/chromadb
+      - MAX_CONCURRENT_REQUESTS=50
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./.kiro/settings:/app/.kiro/settings:ro
+    depends_on:
+      - vllm-chat
+      - vllm-embedding
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # vLLM Chat Service (Qwen3-8B-AWQ)
+  vllm-chat:
+    image: vllm/vllm-openai:latest
+    ports:
+      - "8000:8000"
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+    command: >
+      --model Qwen/Qwen3-8B-AWQ
+      --enable-reasoning
+      --reasoning-parser qwen3
+      --enable-auto-tool-choice
+      --tool-call-parser hermes
+      --max-model-len 8192
+      --gpu-memory-utilization 0.45
+      --quantization awq
+      --host 0.0.0.0
+      --port 8000
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+  # vLLM Embedding Service (Qwen3-Embedding-0.6B)
+  vllm-embedding:
+    image: vllm/vllm-openai:latest
+    ports:
+      - "8001:8001"
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+    command: >
+      --model Qwen/Qwen3-Embedding-0.6B
+      --max-model-len 2048
+      --gpu-memory-utilization 0.45
+      --host 0.0.0.0
+      --port 8001
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+  # Development tools and monitoring (optional)
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    profiles:
+      - monitoring
+
+volumes:
+  chromadb_data:
+    driver: local
+  prometheus_data:
+    driver: local
+
+networks:
+  default:
+    name: llm-agent-network
