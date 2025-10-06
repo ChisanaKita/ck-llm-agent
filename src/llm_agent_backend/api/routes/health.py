@@ -5,17 +5,18 @@ This module provides health check endpoints for monitoring the system
 status and individual service health.
 """
 
-import asyncio
 import logging
 import time
 from typing import Dict, Any
 
 from fastapi import APIRouter, Request, Depends, Query
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from ...config import get_settings
 from ...models.api import HealthResponse, HealthStatus, ServiceHealth
 from ...services.agent_manager import AgentManager
+from ...services.connection_manager import get_connection_manager
+from ...services.resource_manager import get_resource_manager
 from ..middleware.metrics import get_metrics, get_metrics_content_type
 
 
@@ -95,6 +96,46 @@ async def health_check(
             "memory_usage_mb": _get_memory_usage(),
             "active_tasks": len(getattr(agent_manager, '_active_tasks', {})) if agent_manager else 0,
         })
+        
+        # Add connection pool metrics if deep check
+        if deep:
+            try:
+                connection_manager = await get_connection_manager()
+                resource_usage = await connection_manager.get_resource_usage()
+                connection_stats = connection_manager.get_all_stats()
+                
+                health_response.metrics.update({
+                    "connection_pools": {
+                        "total_pools": resource_usage.get("total_pools", 0),
+                        "total_active_requests": resource_usage.get("total_active_requests", 0),
+                        "global_utilization": resource_usage.get("global_utilization", 0),
+                        "available_capacity": resource_usage.get("available_capacity", 0),
+                        "total_requests": connection_stats.get("total_requests", 0),
+                        "error_rate": connection_stats.get("error_rate", 0),
+                    }
+                })
+                
+                # Check connection pool health
+                healthy_pools = connection_manager.get_healthy_pools()
+                unhealthy_pools = connection_manager.get_unhealthy_pools()
+                
+                if unhealthy_pools:
+                    health_response.services["connection_pools"] = ServiceHealth(
+                        status=HealthStatus.DEGRADED,
+                        message=f"Some connection pools unhealthy: {unhealthy_pools}"
+                    )
+                else:
+                    health_response.services["connection_pools"] = ServiceHealth(
+                        status=HealthStatus.HEALTHY,
+                        message=f"All {len(healthy_pools)} connection pools healthy"
+                    )
+                    
+            except Exception as e:
+                logger.warning(f"Failed to get connection pool metrics: {e}")
+                health_response.services["connection_pools"] = ServiceHealth(
+                    status=HealthStatus.DEGRADED,
+                    message=f"Connection pool check failed: {str(e)}"
+                )
         
     except Exception as e:
         logger.error(f"Error during health check: {e}", exc_info=True)
@@ -202,8 +243,6 @@ async def _perform_deep_health_checks(
         health_response: Health response object to update
         agent_manager: AgentManager instance
     """
-    settings = get_settings()
-    
     # Check vLLM endpoints
     try:
         if hasattr(agent_manager, '_llm_handler') and agent_manager._llm_handler:
@@ -305,6 +344,98 @@ def _get_memory_usage() -> float:
     except Exception:
         # Any other error, return 0
         return 0.0
+
+
+@router.get("/health/connections")
+async def connection_health() -> Dict[str, Any]:
+    """
+    Connection pool health and statistics endpoint.
+    
+    Returns detailed information about connection pools, resource usage,
+    and performance metrics.
+    
+    Returns:
+        Dict: Connection pool health and statistics
+    """
+    try:
+        connection_manager = await get_connection_manager()
+        resource_manager = await get_resource_manager()
+        
+        # Get comprehensive connection statistics
+        resource_usage = await connection_manager.get_resource_usage()
+        connection_stats = connection_manager.get_all_stats()
+        resource_manager_stats = resource_manager.get_stats()
+        
+        # Get pool health status
+        healthy_pools = connection_manager.get_healthy_pools()
+        unhealthy_pools = connection_manager.get_unhealthy_pools()
+        
+        return {
+            "status": "healthy" if not unhealthy_pools else "degraded",
+            "timestamp": time.time(),
+            "summary": {
+                "total_pools": len(connection_manager.pools),
+                "healthy_pools": len(healthy_pools),
+                "unhealthy_pools": len(unhealthy_pools),
+                "global_utilization": resource_usage.get("global_utilization", 0),
+                "total_active_requests": resource_usage.get("total_active_requests", 0),
+                "available_capacity": resource_usage.get("available_capacity", 0),
+            },
+            "resource_usage": resource_usage,
+            "connection_stats": connection_stats,
+            "resource_manager": resource_manager_stats,
+            "pool_health": {
+                "healthy": healthy_pools,
+                "unhealthy": unhealthy_pools,
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Connection health check failed: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "timestamp": time.time(),
+                "error": str(e)
+            }
+        )
+
+
+@router.post("/health/connections/cleanup")
+async def force_connection_cleanup() -> Dict[str, Any]:
+    """
+    Force immediate connection pool cleanup.
+    
+    Triggers cleanup of stale connections and optimization of pool sizes.
+    
+    Returns:
+        Dict: Cleanup results
+    """
+    try:
+        resource_manager = await get_resource_manager()
+        
+        # Force cleanup and optimization
+        cleanup_result = await resource_manager.force_cleanup()
+        optimization_result = await resource_manager.force_optimization()
+        
+        return {
+            "status": "completed",
+            "timestamp": time.time(),
+            "cleanup": cleanup_result,
+            "optimization": optimization_result
+        }
+        
+    except Exception as e:
+        logger.error(f"Force cleanup failed: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "timestamp": time.time(),
+                "error": str(e)
+            }
+        )
 
 
 @router.get("/metrics")
