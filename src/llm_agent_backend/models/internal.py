@@ -55,6 +55,10 @@ class AgentConfig(BaseModel):
     )
     temperature: float = Field(default=0.6, ge=0.0, le=2.0, description="LLM temperature")
     
+    # Additional LLM parameters
+    max_tokens: Optional[int] = Field(None, ge=1, description="Maximum tokens to generate")
+    thinking_mode: bool = Field(default=True, description="Enable Qwen3 thinking mode")
+    
     # Tool selection configuration
     max_tools: int = Field(default=5, ge=1, le=20, description="Maximum tools per task")
     tool_selection_strategy: str = Field(
@@ -103,6 +107,10 @@ class AgentTask(BaseModel):
     # Task content
     messages: List[ChatMessage] = Field(..., description="Conversation messages")
     tools: List[Tool] = Field(default_factory=list, description="Available tools")
+    
+    # Request parameters
+    model: str = Field(default="Qwen/Qwen3-8B-AWQ", description="Model name")
+    user_id: Optional[str] = Field(None, description="User identifier")
     
     # Configuration
     config: AgentConfig = Field(default_factory=AgentConfig)
