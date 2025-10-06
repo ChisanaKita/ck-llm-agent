@@ -14,7 +14,7 @@ import argparse
 from ..config import VLLMEndpointConfig
 from ..services.config_validation import get_config_service
 from ..services.health_service import get_health_service
-from ..handlers.endpoint_manager import get_endpoint_manager
+# Avoid circular import - import endpoint_manager when needed
 
 
 logger = logging.getLogger(__name__)
