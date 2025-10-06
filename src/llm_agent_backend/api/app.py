@@ -18,6 +18,8 @@ from fastapi.responses import JSONResponse
 from ..config import get_settings
 from ..models.api import ErrorResponse, ErrorDetail, ErrorType
 from ..services.agent_manager import AgentManager
+from ..services.connection_manager import get_connection_manager, shutdown_connection_manager
+from ..services.resource_manager import get_resource_manager, shutdown_resource_manager
 from .routes import chat, health, models
 from .middleware import (
     AuthenticationMiddleware,
@@ -44,6 +46,14 @@ async def lifespan(app: FastAPI):
         # Startup
         logger.info(f"Starting {settings.app_name} v{settings.app_version}")
         
+        # Initialize connection manager first
+        connection_manager = await get_connection_manager()
+        app.state.connection_manager = connection_manager
+        
+        # Initialize resource manager for background tasks
+        resource_manager = await get_resource_manager()
+        app.state.resource_manager = resource_manager
+        
         # Initialize AgentManager
         agent_manager = AgentManager()
         await agent_manager.initialize()
@@ -65,9 +75,15 @@ async def lifespan(app: FastAPI):
         logger.info("Starting application shutdown...")
         
         try:
-            # Cleanup AgentManager
+            # Cleanup AgentManager first
             if hasattr(app.state, 'agent_manager'):
                 await app.state.agent_manager.shutdown()
+            
+            # Shutdown resource manager
+            await shutdown_resource_manager()
+            
+            # Shutdown connection manager last
+            await shutdown_connection_manager()
             
             logger.info("Application shutdown completed")
             
