@@ -552,3 +552,154 @@ class AgentManager:
             await self._mcp_registry.shutdown()
         
         logger.info("AgentManager shutdown completed")
+    
+    async def process_chat_completion(
+        self,
+        messages: List[Any],
+        model: str,
+        temperature: float = 0.6,
+        max_tokens: Optional[int] = None,
+        tools: Optional[List[Any]] = None,
+        tool_choice: Optional[Any] = None,
+        thinking_mode: bool = True,
+        user: Optional[str] = None,
+        request_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Process a chat completion request through the agent system.
+        
+        Args:
+            messages: List of chat messages
+            model: Model name to use
+            temperature: Sampling temperature
+            max_tokens: Maximum tokens to generate
+            tools: Available tools for the agent
+            tool_choice: Tool choice strategy
+            thinking_mode: Enable Qwen3 thinking mode
+            user: User identifier
+            request_id: Request correlation ID
+            
+        Returns:
+            Dict containing the completion result
+        """
+        from ..models.internal import AgentTask, AgentConfig
+        from ..middleware.metrics import MetricsCollector
+        
+        start_time = time.time()
+        
+        try:
+            # Create agent configuration
+            config = AgentConfig(
+                role=self._default_config.role if self._default_config else "Intelligent Assistant",
+                goal=self._default_config.goal if self._default_config else "Provide helpful responses",
+                backstory=self._default_config.backstory if self._default_config else "Expert AI assistant",
+                temperature=temperature,
+                max_tokens=max_tokens,
+                thinking_mode=thinking_mode,
+                verbose=self.settings.debug,
+                max_execution_time=self.settings.request_timeout
+            )
+            
+            # Create agent task
+            task = AgentTask(
+                id=request_id or str(uuid.uuid4()),
+                messages=messages,
+                tools=tools or [],
+                config=config,
+                user_id=user,
+                model=model
+            )
+            
+            # Submit task and wait for completion
+            task_id = await self.submit_task(task)
+            
+            # Wait for task completion with polling
+            max_wait_time = config.max_execution_time
+            poll_interval = 0.1
+            waited_time = 0
+            
+            while waited_time < max_wait_time:
+                task_status = await self.get_task_status(task_id)
+                
+                if not task_status:
+                    # Task completed and removed from active tasks
+                    break
+                
+                if task_status.status in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.TIMEOUT, TaskStatus.CANCELLED]:
+                    break
+                
+                await asyncio.sleep(poll_interval)
+                waited_time += poll_interval
+            
+            # Get final task result
+            final_task = await self.get_task_status(task_id) or task
+            
+            if final_task.status == TaskStatus.COMPLETED and final_task.result:
+                # Extract response components
+                content = final_task.result.content
+                thinking_content = getattr(final_task.result, 'thinking_content', None)
+                tool_calls = getattr(final_task.result, 'tool_calls', [])
+                
+                # Estimate token usage (in production, this would come from the LLM)
+                prompt_tokens = self._estimate_tokens(" ".join([msg.content or "" for msg in messages]))
+                completion_tokens = self._estimate_tokens(content or "")
+                total_tokens = prompt_tokens + completion_tokens
+                
+                # Record metrics
+                processing_time = time.time() - start_time
+                MetricsCollector.record_chat_completion(
+                    model=model,
+                    status="success",
+                    duration=processing_time,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens
+                )
+                
+                return {
+                    "content": content,
+                    "thinking_content": thinking_content,
+                    "tool_calls": tool_calls,
+                    "usage": {
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                        "total_tokens": total_tokens
+                    },
+                    "processing_time": processing_time
+                }
+            
+            elif final_task.status == TaskStatus.TIMEOUT:
+                MetricsCollector.record_chat_completion(model, "timeout", time.time() - start_time)
+                raise asyncio.TimeoutError("Request processing timed out")
+            
+            elif final_task.status == TaskStatus.FAILED:
+                MetricsCollector.record_chat_completion(model, "error", time.time() - start_time)
+                raise RuntimeError(final_task.error or "Task execution failed")
+            
+            else:
+                MetricsCollector.record_chat_completion(model, "error", time.time() - start_time)
+                raise RuntimeError(f"Task completed with unexpected status: {final_task.status}")
+                
+        except Exception as e:
+            processing_time = time.time() - start_time
+            MetricsCollector.record_chat_completion(model, "error", processing_time)
+            logger.error(f"Chat completion processing failed: {e}", exc_info=True)
+            raise
+    
+    def _estimate_tokens(self, text: str) -> int:
+        """
+        Estimate token count for text.
+        
+        This is a rough estimation. In production, you'd use the actual
+        tokenizer for the model being used.
+        
+        Args:
+            text: Text to estimate tokens for
+            
+        Returns:
+            Estimated token count
+        """
+        if not text:
+            return 0
+        
+        # Rough estimation: ~4 characters per token for English text
+        return max(1, len(text) // 4)
