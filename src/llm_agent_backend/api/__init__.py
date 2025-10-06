@@ -5,5 +5,9 @@ This package contains FastAPI application setup, route definitions,
 and API-specific components.
 """
 
-# API components will be imported as they are implemented
-__all__ = []
+from .app import app, create_app
+
+__all__ = [
+    "app",
+    "create_app",
+]
