@@ -1,0 +1,175 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "llm-agent-backend"
+version = "0.1.0"
+description = "Production-grade LLM agent backend with CrewAI, vLLM, and MCP integration"
+authors = [
+    {name = "Your Name", email = "your.email@example.com"},
+]
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.11"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+dependencies = [
+    # Core web framework
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+    
+    # CrewAI and agent orchestration
+    "crewai>=0.41.0",
+    "crewai-tools>=0.8.0",
+    
+    # HTTP client and async support
+    "aiohttp>=3.9.0",
+    "httpx>=0.25.0",
+    
+    # Data validation and serialization
+    "pydantic>=2.5.0",
+    "pydantic-settings>=2.1.0",
+    
+    # Vector database and embeddings
+    "chromadb>=0.4.18",
+    
+    # Authentication and security
+    "python-jose[cryptography]>=3.3.0",
+    "passlib[bcrypt]>=1.7.4",
+    "python-multipart>=0.0.6",
+    
+    # Monitoring and logging
+    "prometheus-client>=0.19.0",
+    "structlog>=23.2.0",
+    
+    # Configuration and environment
+    "python-dotenv>=1.0.0",
+    
+    # Utilities
+    "tenacity>=8.2.0",
+    "asyncio-throttle>=1.0.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    # Testing
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-cov>=4.1.0",
+    "pytest-mock>=3.12.0",
+    "httpx>=0.25.0",  # For testing FastAPI
+    
+    # Code quality
+    "black>=23.0.0",
+    "isort>=5.12.0",
+    "flake8>=6.0.0",
+    "mypy>=1.7.0",
+    
+    # Performance testing
+    "locust>=2.17.0",
+    "pytest-benchmark>=4.0.0",
+]
+
+production = [
+    # Production ASGI server
+    "gunicorn>=21.2.0",
+    
+    # Monitoring
+    "sentry-sdk[fastapi]>=1.38.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/llm-agent-backend"
+Repository = "https://github.com/yourusername/llm-agent-backend"
+Issues = "https://github.com/yourusername/llm-agent-backend/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/llm_agent_backend"]
+
+[tool.black]
+line-length = 88
+target-version = ['py311']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | build
+  | dist
+)/
+'''
+
+[tool.isort]
+profile = "black"
+multi_line_output = 3
+line_length = 88
+known_first_party = ["llm_agent_backend"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+strict_equality = true
+
+[[tool.mypy.overrides]]
+module = [
+    "crewai.*",
+    "chromadb.*",
+    "prometheus_client.*",
+]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "-ra -q --strict-markers --strict-config"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests",
+    "unit: marks tests as unit tests",
+]
+
+[tool.coverage.run]
+source = ["src"]
+omit = [
+    "*/tests/*",
+    "*/test_*",
+    "*/__pycache__/*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "if self.debug:",
+    "if settings.DEBUG",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if 0:",
+    "if __name__ == .__main__.:",
+    "class .*\\bProtocol\\):",
+    "@(abc\\.)?abstractmethod",
+]
