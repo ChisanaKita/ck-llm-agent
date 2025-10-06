@@ -16,6 +16,7 @@ from .model_utils import (
     validate_chat_completion_request,
     create_task_from_request,
 )
+from .endpoint_tester import EndpointTester
 
 __all__ = [
     # Logging utilities
@@ -42,4 +43,7 @@ __all__ = [
     "create_error_response",
     "validate_chat_completion_request",
     "create_task_from_request",
+    
+    # Testing utilities
+    "EndpointTester",
 ]
