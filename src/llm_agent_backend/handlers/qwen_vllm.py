@@ -2,8 +2,8 @@
 Custom QwenVLLM handler for CrewAI integration.
 
 This module provides a custom BaseLLM implementation that handles Qwen3-8B-AWQ
-model inference through vLLM with OpenAI-compatible API calls, connection pooling,
-retry logic, and thinking content parsing.
+model inference through vLLM with OpenAI-compatible API calls, advanced connection pooling,
+retry logic, and thinking content parsing. Enhanced with connection manager integration.
 """
 
 import asyncio
@@ -18,7 +18,7 @@ from crewai.llm import BaseLLM
 from pydantic import BaseModel, Field
 
 from ..config import get_settings
-
+from ..services.connection_manager import get_connection_manager, ConnectionPool
 
 logger = logging.getLogger(__name__)
 
@@ -183,88 +183,6 @@ class VLLMResponse(BaseModel):
     choices: List[Dict[str, Any]]
     usage: Dict[str, int]
     reasoning_content: Optional[str] = None
-
-
-class ConnectionPool:
-    """Manages aiohttp ClientSession with connection pooling and authentication."""
-
-    def __init__(
-        self,
-        base_url: str,
-        pool_size: int = 10,
-        timeout: int = 60,
-        api_key: Optional[str] = None,
-        headers: Optional[Dict[str, str]] = None,
-    ):
-        self.base_url = base_url.rstrip("/")
-        self.pool_size = pool_size
-        self.timeout = aiohttp.ClientTimeout(total=timeout)
-        self.api_key = api_key
-        self.custom_headers = headers or {}
-        self._session: Optional[aiohttp.ClientSession] = None
-        self._connector: Optional[aiohttp.TCPConnector] = None
-
-    async def get_session(self) -> aiohttp.ClientSession:
-        """Get or create aiohttp session with connection pooling."""
-        if self._session is None or self._session.closed:
-            self._connector = aiohttp.TCPConnector(
-                limit=self.pool_size,
-                limit_per_host=self.pool_size,
-                keepalive_timeout=30,
-                enable_cleanup_closed=True,
-                # Enable SSL verification for external endpoints
-                verify_ssl=True,
-            )
-
-            # Build headers
-            headers = {
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-                "User-Agent": "LLM-Agent-Backend/1.0",
-            }
-
-            # Add API key authentication if provided
-            if self.api_key:
-                # Support different auth header formats
-                if "runpod" in self.base_url.lower():
-                    headers["Authorization"] = f"Bearer {self.api_key}"
-                else:
-                    headers["X-API-Key"] = self.api_key
-
-            # Add custom headers
-            headers.update(self.custom_headers)
-
-            self._session = aiohttp.ClientSession(
-                connector=self._connector, timeout=self.timeout, headers=headers
-            )
-
-        return self._session
-
-    async def close(self):
-        """Close the session and connector."""
-        if self._session and not self._session.closed:
-            await self._session.close()
-        if self._connector:
-            await self._connector.close()
-
-    def update_config(
-        self,
-        base_url: Optional[str] = None,
-        api_key: Optional[str] = None,
-        headers: Optional[Dict[str, str]] = None,
-    ):
-        """Update connection configuration and recreate session."""
-        if base_url:
-            self.base_url = base_url.rstrip("/")
-        if api_key is not None:
-            self.api_key = api_key
-        if headers:
-            self.custom_headers.update(headers)
-
-        # Force session recreation on next request
-        if self._session and not self._session.closed:
-            asyncio.create_task(self._session.close())
-            self._session = None
 
 
 class RetryConfig(BaseModel):
@@ -538,14 +456,9 @@ class QwenVLLM(BaseLLM):
         self.endpoint_config = endpoint_config or {}
         self.api_key = chat_config.api_key
 
-        # Initialize connection pool with authentication
-        self.connection_pool = ConnectionPool(
-            base_url=self.base_url,
-            pool_size=chat_config.connection_pool_size,
-            timeout=chat_config.timeout,
-            api_key=self.api_key,
-            headers=self.endpoint_config.get("headers", {}),
-        )
+        # Initialize connection pool using connection manager
+        self.connection_pool: Optional[ConnectionPool] = None
+        self._connection_manager_initialized = False
 
         # Initialize health monitoring and circuit breaker
         self.health_monitor = HealthMonitor(base_url=self.base_url, timeout=5.0)
@@ -574,6 +487,19 @@ class QwenVLLM(BaseLLM):
             f"temperature={self.temperature}, thinking_mode={self.thinking_mode}"
         )
 
+    async def _ensure_connection_pool(self) -> None:
+        """Ensure connection pool is initialized."""
+        if not self._connection_manager_initialized:
+            settings = get_settings()
+            chat_config = settings.vllm.get_chat_config()
+
+            # Get connection manager and create pool
+            connection_manager = await get_connection_manager()
+            self.connection_pool = await connection_manager.get_or_create_pool(
+                endpoint_config=chat_config, pool_id=f"qwen_chat_{hash(self.base_url)}"
+            )
+            self._connection_manager_initialized = True
+
     async def call(
         self,
         messages: List[Dict[str, Any]],
@@ -592,6 +518,9 @@ class QwenVLLM(BaseLLM):
             Dict containing response with separated thinking content
         """
         try:
+            # Ensure connection pool is initialized
+            await self._ensure_connection_pool()
+
             # Convert messages to proper format
             formatted_messages = self._format_messages(messages)
 
@@ -673,20 +602,25 @@ class QwenVLLM(BaseLLM):
         Returns:
             Response data as dict
         """
-        session = await self.connection_pool.get_session()
+        if not self.connection_pool:
+            raise RuntimeError("Connection pool not initialized")
+
         url = urljoin(self.base_url, "/v1/chat/completions")
 
-        async with session.post(url, json=payload) as response:
-            if response.status != 200:
-                error_text = await response.text()
-                raise aiohttp.ClientResponseError(
-                    request_info=response.request_info,
-                    history=response.history,
-                    status=response.status,
-                    message=f"vLLM request failed: {error_text}",
-                )
+        response = await self.connection_pool.make_request(
+            method="POST", url=url, json=payload
+        )
 
-            return await response.json()
+        if response.status != 200:
+            error_text = await response.text()
+            raise aiohttp.ClientResponseError(
+                request_info=response.request_info,
+                history=response.history,
+                status=response.status,
+                message=f"vLLM request failed: {error_text}",
+            )
+
+        return await response.json()
 
     def _calculate_retry_delay(self, attempt: int) -> float:
         """
