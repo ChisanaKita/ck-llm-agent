@@ -1,0 +1,36 @@
+# Prometheus configuration for LLM Agent Backend monitoring
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  # - "first_rules.yml"
+  # - "second_rules.yml"
+
+scrape_configs:
+  # LLM Agent Backend metrics
+  - job_name: 'llm-agent-backend'
+    static_configs:
+      - targets: ['llm-agent-backend:8080']
+    metrics_path: '/metrics'
+    scrape_interval: 30s
+
+  # vLLM Chat Server metrics
+  - job_name: 'vllm-chat'
+    static_configs:
+      - targets: ['vllm-chat:8000']
+    metrics_path: '/metrics'
+    scrape_interval: 30s
+
+  # vLLM Embedding Server metrics  
+  - job_name: 'vllm-embedding'
+    static_configs:
+      - targets: ['vllm-embedding:8001']
+    metrics_path: '/metrics'
+    scrape_interval: 30s
+
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
